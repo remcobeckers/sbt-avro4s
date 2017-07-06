@@ -68,32 +68,40 @@ object Avro4sSbtPlugin extends AutoPlugin {
   )
 
   private def runAvro2Class: Def.Initialize[Task[Seq[File]]] = Def.task {
+    val avroChanges = Difference.inputs(streams.value.cacheDirectory / "avro-file-changes", FilesInfo.hash)
 
     val inc = (includeFilter in avro2Class).value
     val exc = (excludeFilter in avro2Class).value || DirectoryFilter
     val inDir = (resourceDirectories in avro2Class).value
     val outDir = (sourceManaged in avro2Class).value
 
-    streams.value.log.info(s"[sbt-avro4s] Generating sources from [${inDir}]")
-    streams.value.log.info("--------------------------------------------------------------")
-
     val combinedFileFilter = inc -- exc
     val allFiles = (resources in avro2Class).value
     val schemaFiles = Option(allFiles.filter(combinedFileFilter.accept))
-    streams.value.log.info(s"[sbt-avro4s] Found ${schemaFiles.fold(0)(_.length)} schemas")
-    schemaFiles.map { f =>
-      val defs = ModuleGenerator.fromFiles(f)
-      streams.value.log.info(s"[sbt-avro4s] Generated ${defs.length} classes")
 
-      val paths = FileRenderer.render(outDir.toPath, TemplateGenerator.apply(defs))
-      streams.value.log.info(s"[sbt-avro4s] Wrote class files to [${outDir.toPath}]")
+    schemaFiles.map { files =>
+      avroChanges(files.toSet) { report =>
+        if (report.modified.nonEmpty || report.removed.nonEmpty) {
+          streams.value.log.info(s"[sbt-avro4s] Generating sources from [${inDir}]")
+          streams.value.log.info("--------------------------------------------------------------")
 
-      paths
-    }.getOrElse(Seq()).map(_.toFile)
+          streams.value.log.info(s"[sbt-avro4s] Found ${schemaFiles.fold(0)(_.length)} schemas")
+          val defs = ModuleGenerator.fromFiles(files)
+          streams.value.log.info(s"[sbt-avro4s] Generated ${defs.length} classes")
+
+          val paths = FileRenderer.render(outDir.toPath, TemplateGenerator.apply(defs))
+          streams.value.log.info(s"[sbt-avro4s] Wrote class files to [${outDir.toPath}]")
+
+          paths.map(_.toFile)
+        } else (outDir ** ("*.scala" || "*.java")).get
+      }
+    }.getOrElse(Seq())
+
   } dependsOn avroIdl2Avro
 
   private def runAvroIdl2Avro: Def.Initialize[Task[Seq[File]]] = Def.task {
     import org.apache.avro.compiler.idl.Idl
+    val idlChanges = Difference.inputs(streams.value.cacheDirectory / "idl-file-changes", FilesInfo.hash)
 
     val inc = (includeFilter in avroIdl2Avro).value
     val exc = (excludeFilter in avroIdl2Avro).value || DirectoryFilter
@@ -101,46 +109,48 @@ object Avro4sSbtPlugin extends AutoPlugin {
     val outDir = (resourceManaged in avroIdl2Avro).value
     val outExt = s".${avroFileEnding.value}"
 
-    streams.value.log.info(s"[sbt-avro4s] Generating sources from [${inDir}]")
-    streams.value.log.info("--------------------------------------------------------------")
-
     val combinedFileFilter = inc -- exc
     val allFiles = (resources in avroIdl2Avro).value
     val idlFiles = Option(allFiles.filter(combinedFileFilter.accept))
-    streams.value.log.info(s"[sbt-avro4s] Found ${idlFiles.fold(0)(_.length)} IDLs")
+    idlFiles.map { files =>
+      idlChanges(files.toSet) { report =>
+        if (report.modified.nonEmpty || report.removed.nonEmpty) {
+          streams.value.log.info(s"[sbt-avro4s] Generating sources from [${inDir}]")
+          streams.value.log.info("--------------------------------------------------------------")
+          streams.value.log.info(s"[sbt-avro4s] Found ${idlFiles.fold(0)(_.length)} IDLs")
 
-    val schemata = idlFiles.map { f =>
-      f.flatMap( file => {
-        val idl = new Idl(file.getAbsoluteFile)
-        val protocol: Protocol = idl.CompilationUnit()
-        val protocolSchemata = protocol.getTypes
-        idl.close()
-        protocolSchemata.asScala
+          val schemata = files.flatMap(file => {
+            val idl = new Idl(file.getAbsoluteFile)
+            val protocol: Protocol = idl.CompilationUnit()
+            val protocolSchemata = protocol.getTypes
+            idl.close()
+            protocolSchemata.asScala
+          }).toSeq
+
+          val uniqueSchemata = schemata.groupBy(_.getFullName).mapValues { identicalSchemata =>
+            val referenceSchema = identicalSchemata.head
+            identicalSchemata.foreach { schema =>
+              require(referenceSchema.equals(schema), s"Different schemata with name ${referenceSchema.getFullName} found")
+            }
+            referenceSchema
+          }.values
+
+          streams.value.log.info(s"[sbt-avro4s] Generated ${uniqueSchemata.size} unique schema(-ta)")
+
+          Files.createDirectories(outDir.toPath)
+          val schemaFiles = (for (s <- uniqueSchemata if s.getType == AvroType.RECORD) yield {
+            val path = Paths.get(outDir.absolutePath, s.getFullName + outExt)
+            val writer = Files.newBufferedWriter(path)
+            writer.write(s.toString(true))
+            writer.close()
+            path.toFile
+          }).toSeq
+
+          streams.value.log.info(s"[sbt-avro4s] Wrote schema(-ta) to [${outDir.toPath}]")
+          schemaFiles
+        } else (outDir ** s"*.$outExt").get
       }
-      ).toSeq
     }.getOrElse(Seq())
-
-    val uniqueSchemata = schemata.groupBy(_.getFullName).mapValues { identicalSchemata =>
-      val referenceSchema = identicalSchemata.head
-      identicalSchemata.foreach { schema =>
-        require(referenceSchema.equals(schema), s"Different schemata with name ${referenceSchema.getFullName} found")
-      }
-      referenceSchema
-    }.values
-
-    streams.value.log.info(s"[sbt-avro4s] Generated ${uniqueSchemata.size} unique schema(-ta)")
-
-    Files.createDirectories(outDir.toPath)
-    val schemaFiles = (for (s <- uniqueSchemata if s.getType == AvroType.RECORD) yield {
-      val path = Paths.get(outDir.absolutePath, s.getFullName + outExt)
-      val writer = Files.newBufferedWriter(path)
-      writer.write(s.toString(true))
-      writer.close()
-      path.toFile
-    }).toSeq
-
-    streams.value.log.info(s"[sbt-avro4s] Wrote schema(-ta) to [${outDir.toPath}]")
-    schemaFiles
   }
 
   def getRecursiveListOfFiles(dir: File): Array[File] = {
